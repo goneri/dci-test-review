@@ -1,0 +1,176 @@
+---
+- name: launch the VM
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Create new keypair from current user default SSH key
+      os_keypair:
+        state: present
+        name: ansible_key
+        public_key_file: "{{ '~' | expanduser }}/.ssh/id_rsa.pub"
+    - name: Create the test network
+      os_network:
+        state: present
+        name: private
+        external: False
+        shared: False
+      register: private_network
+    - name: Create the test subnet
+      os_subnet:
+        state: present
+        network_name: "{{ private_network.id }}"
+        name: private_sub
+        ip_version: 4
+        cidr: 192.168.0.0/24
+        gateway_ip: 192.168.0.1
+        enable_dhcp: yes
+        dns_nameservers:
+          - 10.11.5.19
+          - 10.5.30.160
+      register: private_sub
+    - name: Create the test router
+      ignore_errors: yes #for some reasons, re-running this task gives errors
+      os_router:
+        state: present
+        name: private_router
+        network: public
+        interfaces:
+          - private_sub
+    - os_security_group:
+        state: present
+        name: ssh
+    - os_security_group_rule:
+        protocol: tcp
+        security_group: ssh
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+    - os_security_group:
+        state: present
+        name: dci_ui
+    - os_security_group_rule:
+        protocol: tcp
+        security_group: dci_ui
+        port_range_min: '{{ item }}'
+        port_range_max: '{{ item }}'
+        remote_ip_prefix: 0.0.0.0/0
+      with_items:
+        - 8080
+        - 8000
+        - 5000
+    - os_server:
+        state: absent
+        name: 'test-ui-vm'
+    - name: launch the VM
+      os_server:
+        state: present
+        name: 'test-ui-vm'
+        image: CentOS-7-x86_64-GenericCloud-1708
+        key_name: ansible_key
+        timeout: 200
+        flavor: baremetal
+        security_groups: ['default', 'ssh', 'dci_ui']
+        volume_size: 60
+        network: private
+        wait: True
+      register: nova_vm
+
+    - name: Show Server IP
+      debug: var=nova_vm.openstack.public_v4
+
+    - name: Add the VM to the inventory
+      add_host:
+        name: 'test-ui-vm'
+        hostname: "{{ nova_vm.openstack.public_v4 }}"
+        ansible_host: "{{ nova_vm.openstack.public_v4 }}"
+        ansible_user: centos
+
+- name: deploy the feeder
+  hosts: test-ui-vm
+  gather_facts: no
+  tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+
+- name: deploy the feeder
+  hosts: test-ui-vm
+  tasks:
+    - selinux:
+        policy: targeted
+        state: permissive
+      become: True
+    - package:
+        name: epel-release
+        state: present
+      become: True
+    - package:
+        name: '{{ item }}'
+        state: present
+      with_items:
+        - git
+        - docker
+        - docker-compose
+      become: True
+    - git:
+        repo: https://github.com/redhat-cip/dci-dev-env
+        dest: dci-dev-env
+    - name: Reduce Docker MTU to match the VM MTU
+      copy:
+        content: |
+                {"mtu": 1400}
+        dest: /etc/docker/daemon.json
+      become: True
+    - name: Start the docker service
+      service:
+        name: docker
+        state: started
+      become: True
+    - name: Pull the git repositories
+      command: bash utils/bootstrap.sh
+      args:
+       chdir: dci-dev-env
+       creates: /tmp/git_repos_ready
+    - name: Get the review details
+      uri:
+        url: 'https://softwarefactory-project.io/r/changes/{{ review_id }}/detail?O=2002'
+        return_content: yes
+        body_format: raw
+      register: response
+    - set_fact:
+        gerrit_review: '{{ response.content[5:]|from_json }}'
+    - set_fact:
+        checkout_command: '{{ gerrit_review.revisions[gerrit_review.current_revision].fetch["anonymous http"].commands.Checkout }}'
+    - name: Fetch the git review
+      shell: '{{ checkout_command }}' 
+      args:
+        chdir: 'dci-dev-env/{{ gerrit_review.project }}'
+    - name: Write DCI-UI configuration
+      copy:
+        content: |
+                {"apiURL": "http://{{ hostvars['test-ui-vm']['ansible_host'] }}:5000", "sso": {"url": "http://{{ hostvars['test-ui-vm']['ansible_host'] }}:8180","realm": "dci-test", "clientId": "dci"}}
+        dest: /home/centos/dci-dev-env/dci-ui/src/config.json
+    - name: Build the images
+      shell: 'sudo docker-compose -f dci.yml build' 
+      args:
+        chdir: 'dci-dev-env'
+      register: task_result
+      until: task_result.rc == 0
+      retries: 3
+      delay: 1
+      ignore_errors: yes
+    - name: Start docker compose
+      shell: 'sudo docker-compose -f dci.yml up -d ui' 
+      args:
+        chdir: 'dci-dev-env'
+      register: task_result
+      until: task_result.rc == 0
+      retries: 3
+      delay: 1
+      ignore_errors: yes
+    - name: DB provisioning 
+      shell: 'sudo docker exec dcidevenv_api_1 ./bin/dci-dbprovisioning' 
+      args:
+        chdir: 'dci-dev-env'
+    - debug:
+        msg: "You can now connect to the interface: http://{{ hostvars['test-ui-vm']['ansible_host'] }}:8000"
+
